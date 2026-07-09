@@ -1,0 +1,15 @@
+[Unit]
+Description=LK-222 piano playback server (MIDI+WAV simultaneous)
+After=network-online.target remote-fs.target sound.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/ha-config
+
+[Service]
+Type=simple
+User=yunomin61
+ExecStart=/usr/bin/python3 /home/yunomin61/piano_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
