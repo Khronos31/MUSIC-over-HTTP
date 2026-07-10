@@ -10,10 +10,9 @@ DG-STK5S（Ubuntu Server、家庭内LAN上のMIDI/USBオーディオ集約ホス
 
 ## API
 
-```
-POST /play_song
-Content-Type: application/json
+### `POST /play_song`
 
+```
 {"wav_filename": "song-xxxx.wav", "midi_filename": "kirakira.mid"}
 # または
 {"wav_filename": "song-xxxx.wav", "abc": "X:1\nT:...\n%%MIDI channel 3\n...", "midi_delay_sec": 0.25}
@@ -26,6 +25,14 @@ Content-Type: application/json
 - `midi_delay_sec`: MIDI開始を指定秒数だけ遅らせる（任意、デフォルト0）。VOICEVOX Songの歌声WAVは冒頭に約0.16秒の無音パディングがあり、実機テストでは`0.25`でほぼ同期が取れることを確認済み
 - MIDIチャンネル3・4を使うとLK-222の鍵盤がライトアップする(ナビゲートチャンネル)。**ch3=左手側、ch4=右手側**(本体の取扱説明書より)。ch1/2は発音のみ
 - 和音はABC記法の角括弧`[CEG]`で指定できる（同一チャンネルで複数Note Onが同時に飛ぶだけ）。ch3に低音の伴奏コード、ch4に高音のメロディを割り当てた2声デュエットの実機演奏を確認済み(2026-07-10)
+
+### `POST /save_song`
+
+```
+{"name": "kirakira_duet", "abc": "X:1\nT:...\n...", "wav_filename": "song-xxxx.wav"}
+```
+
+あかね(embodied-ha側のエージェント)はWriteツールを持たないため、「残したい曲」を永続化するための保存専用エンドポイント。`name`(英数字・`_`・`-`のみ)をキーに、`SONG_LIBRARY_DIR`(`/mnt/ha-config/embodied-ha/song_library/`)配下へ`{name}.abc`・`{name}.mid`（abcから変換済み）・（`wav_filename`指定時のみ）`{name}.wav`をセットで保存する。同名は上書き。`/home/yunomin61/piano_abc_cache/`（`/play_song`のabc変換に使う使い捨てキャッシュ）とは別の永続領域。
 
 呼び出し元の使い方（家全体のコンテキストにおけるこのAPIの位置づけ）は `Khronos31/embodied-ha` リポジトリの `/config/embodied-ha/device_apis.md`（あかね向けドキュメント）を参照。
 
