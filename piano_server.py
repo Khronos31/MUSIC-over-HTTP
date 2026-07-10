@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MIDI_DIR = "/mnt/ha-config/embodied-ha/midi"
 WAV_DIR = "/mnt/ha-config/embodied-ha/wav"
-MIDI_PORT = "24:0"  # aplaymidi -l で確認した CASIO USB-MIDI のポート
+MIDI_CLIENT_NAME = "CASIO USB-MIDI"  # aplaymidi -l のクライアント名。ポート番号(例:24:0)は起動ごとに変わるため名前で解決する
 AUDIO_DEVICE = "plughw:CARD=Audio,DEV=0"  # USBオーディオアダプタ(iStore Audio)
 ABC_CACHE_DIR = "/home/yunomin61/piano_abc_cache"
 BIND_HOST = "0.0.0.0"
@@ -58,14 +58,23 @@ def _abc_to_midi(abc_text: str) -> str:
     return midi_path
 
 
+def _resolve_midi_port() -> str:
+    proc = subprocess.run(["aplaymidi", "-l"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        if MIDI_CLIENT_NAME in line:
+            return line.split()[0]
+    raise RuntimeError(f"MIDI port not found for client {MIDI_CLIENT_NAME!r}: {proc.stdout.decode(errors='replace')}")
+
+
 def play_song(*, wav_filename: str, midi_filename: str = "", abc: str = "") -> dict:
     if bool(midi_filename) == bool(abc):
         raise ValueError("midi_filename と abc はどちらか一方だけ指定してください")
     wav_path = _safe_path(WAV_DIR, wav_filename)
     midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
+    midi_port = _resolve_midi_port()
 
     midi_proc = subprocess.Popen(
-        ["aplaymidi", "-p", MIDI_PORT, midi_path],
+        ["aplaymidi", "-p", midi_port, midi_path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     wav_proc = subprocess.Popen(

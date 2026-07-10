@@ -1,8 +1,7 @@
 [Unit]
 Description=LK-222 piano playback server (MIDI+WAV simultaneous)
-After=network-online.target remote-fs.target sound.target
+After=network-online.target sound.target
 Wants=network-online.target
-RequiresMountsFor=/mnt/ha-config
 
 [Service]
 Type=simple
