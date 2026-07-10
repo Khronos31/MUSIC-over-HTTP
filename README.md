@@ -32,6 +32,12 @@ DG-STK5S（Ubuntu Server、家庭内LAN上のMIDI/USBオーディオ集約ホス
 
 現在の再生状態と直近の結果を返す: `{"playing": bool, "started_at": epoch, "finished_at": epoch|null, "summary": {...}, "result": {...}|null}`
 
+### `GET /history` — 30日間の安全網
+
+`/play_song`が受け取ったリクエストは（`/save_song`を呼んだかどうかに関わらず）`/home/yunomin61/piano_history/`に**30日間**そのままJSON保存される。一覧は`{"history": [{"file":..., "received_at":epoch, "title": "abcのTフィールド|library_name|null", "has_wav": bool, "has_miku": bool}, ...]}`。
+
+これは「歌詞をあかねから一言も聞かずに`/play_song`で直接送られた`miku_notes`は、`/save_song`し忘れると永久に失われる」という実インシデント（初オリジナル曲「はじめてのうた」のミクパートを一時ロスト。最終的にはClaude Codeのセッション履歴から手動復元できたが、常にそうとは限らない）を受けて追加した。`song_library`（明示的な永続化）とは別の、取りこぼし防止のセーフティネット。
+
 ### `POST /save_song`
 
 ```
