@@ -4,16 +4,21 @@
 POST /play_song
   {"wav_filename": "...", "midi_filename": "..."}  # 用意済みMIDIファイルを使う
   {"wav_filename": "...", "abc": "X:1\\nT:...\\n..."}  # ABC記法テキストをその場でabc2midi変換して使う
-  {"midi_filename": "..."} / {"abc": "..."}  # wav_filename省略でピアノ単独演奏
-  - midi_filename/abcはどちらか一方を指定する。wav_filenameは省略可（省略時はMIDIのみ再生）。
+  {"library_name": "kirakira_duet"}  # save_songで保存済みの曲を名前指定で再生
+  {"midi_filename": "..."} / {"abc": "..."} / {"library_name": "..."}  # wav_filename省略でピアノ単独演奏
+  - midi_filename/abc/library_nameはいずれか一つだけ指定する。wav_filenameは省略可
+    （省略時はMIDIのみ再生。library_name指定時は対応する{name}.wavが存在すれば自動で使う）。
   - MIDI/WAVの再生元ファイル名(basenameのみ)はホワイトリスト検証する。
-  - wav_filename指定時はaplaymidiとaplayを同時に起動し、両方の終了を待って結果を返す。
+  - wav指定時はaplaymidiとaplayを同時に起動し、両方の終了を待って結果を返す。
 
 POST /save_song
   {"name": "kirakira_duet", "abc": "X:1\\nT:...\\n...", "wav_filename": "song-xxxx.wav"}
   - あかねはWriteツールを持たないため、「残したい曲」を永続化するための保存専用エンドポイント。
   - name(英数字・_・-のみ)を key に、abcテキストと変換済みMIDI、(あれば)WAVのコピーをSONG_LIBRARY_DIR配下に
     {name}.abc / {name}.mid / {name}.wav としてセットで保存する。同名は上書き。
+
+GET /songs
+  - SONG_LIBRARY_DIRに保存済みの曲一覧を返す: {"songs": [{"name": "...", "has_wav": true/false}, ...]}
 
 ABC_CACHE_DIR(/play_song の abc 変換で使う一時ファイル置き場)は7日より古いファイルを
 次回のabc変換時に自動削除する(使い捨て)。残したい曲は/save_songで明示的に保存すること。
@@ -113,6 +118,20 @@ def save_song(*, name: str, abc: str, wav_filename: str = "") -> dict:
     return result
 
 
+def list_songs() -> list[dict]:
+    if not os.path.isdir(SONG_LIBRARY_DIR):
+        return []
+    names = sorted({
+        os.path.splitext(fname)[0]
+        for fname in os.listdir(SONG_LIBRARY_DIR)
+        if fname.endswith(".abc")
+    })
+    return [
+        {"name": name, "has_wav": os.path.isfile(os.path.join(SONG_LIBRARY_DIR, f"{name}.wav"))}
+        for name in names
+    ]
+
+
 def _resolve_midi_port() -> str:
     proc = subprocess.run(["aplaymidi", "-l"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for line in proc.stdout.decode(errors="replace").splitlines():
@@ -121,17 +140,39 @@ def _resolve_midi_port() -> str:
     raise RuntimeError(f"MIDI port not found for client {MIDI_CLIENT_NAME!r}: {proc.stdout.decode(errors='replace')}")
 
 
-def play_song(*, wav_filename: str = "", midi_filename: str = "", abc: str = "", midi_delay_sec: float = 0.0) -> dict:
-    if bool(midi_filename) == bool(abc):
-        raise ValueError("midi_filename と abc はどちらか一方だけ指定してください")
-    midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
+def play_song(
+    *,
+    wav_filename: str = "",
+    midi_filename: str = "",
+    abc: str = "",
+    library_name: str = "",
+    midi_delay_sec: float = 0.0,
+) -> dict:
+    modes_given = sum(bool(x) for x in (midi_filename, abc, library_name))
+    if modes_given != 1:
+        raise ValueError("midi_filename, abc, library_name のいずれか一つだけ指定してください")
+
+    if library_name:
+        if not _NAME_RE.match(library_name):
+            raise ValueError(f"invalid library_name: {library_name!r}")
+        midi_path = os.path.join(SONG_LIBRARY_DIR, f"{library_name}.mid")
+        if not os.path.isfile(midi_path):
+            raise FileNotFoundError(f"not found: {midi_path}")
+        if wav_filename:
+            wav_path = _safe_path(WAV_DIR, wav_filename)
+        else:
+            candidate = os.path.join(SONG_LIBRARY_DIR, f"{library_name}.wav")
+            wav_path = candidate if os.path.isfile(candidate) else ""
+    else:
+        midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
+        wav_path = _safe_path(WAV_DIR, wav_filename) if wav_filename else ""
+
     midi_port = _resolve_midi_port()
 
     # VOICEVOX Songの歌声WAVは冒頭に無音パディングがあり、MIDIより聴感上の発音が遅れる。
-    # midi_delay_secでMIDI側の開始を後ろにずらして聴感上の頭出しを揃える。wav_filename省略時はピアノ単独演奏。
+    # midi_delay_secでMIDI側の開始を後ろにずらして聴感上の頭出しを揃える。wav省略時はピアノ単独演奏。
     wav_proc = None
-    if wav_filename:
-        wav_path = _safe_path(WAV_DIR, wav_filename)
+    if wav_path:
         wav_proc = subprocess.Popen(
             ["aplay", "-D", AUDIO_DEVICE, wav_path],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -174,9 +215,14 @@ class Handler(BaseHTTPRequestHandler):
                 wav_filename = str(data.get("wav_filename") or "")
                 midi_filename = str(data.get("midi_filename") or "")
                 abc = str(data.get("abc") or "")
+                library_name = str(data.get("library_name") or "")
                 midi_delay_sec = float(data.get("midi_delay_sec") or 0.0)
                 result = play_song(
-                    wav_filename=wav_filename, midi_filename=midi_filename, abc=abc, midi_delay_sec=midi_delay_sec
+                    wav_filename=wav_filename,
+                    midi_filename=midi_filename,
+                    abc=abc,
+                    library_name=library_name,
+                    midi_delay_sec=midi_delay_sec,
                 )
                 ok = result["midi"]["returncode"] == 0 and (result["wav"] is None or result["wav"]["returncode"] == 0)
                 self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", **result})
@@ -188,6 +234,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "ok", **result})
         except (ValueError, FileNotFoundError) as exc:
             self._send_json(400, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": str(exc)})
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/songs":
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            songs = list_songs()
+            self._send_json(200, {"songs": songs})
         except Exception as exc:  # noqa: BLE001
             self._send_json(500, {"error": str(exc)})
 
