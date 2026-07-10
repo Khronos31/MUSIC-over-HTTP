@@ -20,6 +20,12 @@ POST /save_song
 GET /songs
   - SONG_LIBRARY_DIRに保存済みの曲一覧を返す: {"songs": [{"name": "...", "has_wav": true/false}, ...]}
 
+miku_notes(任意, /play_songの追加パラメータ)
+  {"miku_notes": [{"pitch": "C4", "duration": "quarter", "lyric": "き"}, ...], "miku_bpm": 120}
+  - NSX-39(ポケット・ミク)に歌詞SysExを流し込み、Note On/Offで1音節ずつ歌わせる。
+  - 形式はembodied-ha側のrecordツールと同一(pitch=音名/rest, duration=whole..sixteenth, lyric=ひらがな1音節)。
+  - abc/midi_filename/wav_filenameと併用可。ミク単独(miku_notesのみ)でもよい。最大64音節。
+
 ABC_CACHE_DIR(/play_song の abc 変換で使う一時ファイル置き場)は7日より古いファイルを
 次回のabc変換時に自動削除する(使い捨て)。残したい曲は/save_songで明示的に保存すること。
 
@@ -33,6 +39,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,6 +56,44 @@ BIND_PORT = 8090
 
 _FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# --- NSX-39 (ポケット・ミク) ---
+MIKU_DEVICE_NAME = "NSX-39"  # amidi -l の名前。カード番号は接続順で変わるため名前で解決する
+MIKU_MAX_SYLLABLES = 64  # 歌詞SysExの1スロット上限
+_PITCH_RE = re.compile(r"^([A-Ga-g])([#b]?)(-?\d+)$")
+_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+_DURATION_BEATS = {"whole": 4.0, "half": 2.0, "quarter": 1.0, "eighth": 0.5, "sixteenth": 0.25}
+
+# ひらがな→NSX-39音素コード (Yamaha公式 nsx39.js 由来、2026-06-30実機検証済み)
+_MIKU_PHONEMES = {
+    "あ": 0x00, "い": 0x01, "う": 0x02, "え": 0x03, "お": 0x04,
+    "か": 0x05, "き": 0x06, "く": 0x07, "け": 0x08, "こ": 0x09,
+    "が": 0x0A, "ぎ": 0x0B, "ぐ": 0x0C, "げ": 0x0D, "ご": 0x0E,
+    "さ": 0x15, "し": 0x20, "す": 0x17, "せ": 0x18, "そ": 0x19,
+    "ざ": 0x1A, "じ": 0x25, "ず": 0x1C, "ぜ": 0x1D, "ぞ": 0x1E,
+    "た": 0x29, "ち": 0x36, "つ": 0x3C, "て": 0x2C, "と": 0x2D,
+    "だ": 0x2E, "で": 0x31, "ど": 0x32, "づ": 0x1C,
+    "な": 0x3F, "に": 0x40, "ぬ": 0x41, "ね": 0x42, "の": 0x43,
+    "は": 0x47, "ひ": 0x48, "ふ": 0x49, "へ": 0x4A, "ほ": 0x4B,
+    "ば": 0x4C, "び": 0x4D, "ぶ": 0x4E, "べ": 0x4F, "ぼ": 0x50,
+    "ぱ": 0x51, "ぴ": 0x52, "ぷ": 0x53, "ぺ": 0x54, "ぽ": 0x55,
+    "ま": 0x64, "み": 0x65, "む": 0x66, "め": 0x67, "も": 0x68,
+    "や": 0x6C, "ゆ": 0x6D, "よ": 0x6E,
+    "ら": 0x6F, "り": 0x70, "る": 0x71, "れ": 0x72, "ろ": 0x73,
+    "わ": 0x77, "を": 0x7A, "ん": 0x7B,
+    "きゃ": 0x0F, "きゅ": 0x10, "きょ": 0x11,
+    "ぎゃ": 0x12, "ぎゅ": 0x13, "ぎょ": 0x14,
+    "しゃ": 0x1F, "しゅ": 0x21, "しょ": 0x23,
+    "じゃ": 0x24, "じゅ": 0x26, "じょ": 0x28,
+    "ちゃ": 0x35, "ちゅ": 0x37, "ちょ": 0x39,
+    "にゃ": 0x44, "にゅ": 0x45, "にょ": 0x46,
+    "ひゃ": 0x56, "ひゅ": 0x57, "ひょ": 0x58,
+    "びゃ": 0x59, "びゅ": 0x5A, "びょ": 0x5B,
+    "ぴゃ": 0x5C, "ぴゅ": 0x5D, "ぴょ": 0x5E,
+    "ふぁ": 0x5F, "ふぃ": 0x60, "ふぇ": 0x62,
+    "みゃ": 0x69, "みゅ": 0x6A, "みょ": 0x6B,
+    "りゃ": 0x74, "りゅ": 0x75, "りょ": 0x76,
+}
 
 
 def _safe_path(base_dir: str, filename: str) -> str:
@@ -140,6 +185,77 @@ def _resolve_midi_port() -> str:
     raise RuntimeError(f"MIDI port not found for client {MIDI_CLIENT_NAME!r}: {proc.stdout.decode(errors='replace')}")
 
 
+def _resolve_miku_rawmidi() -> str:
+    proc = subprocess.run(["amidi", "-l"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = proc.stdout.decode(errors="replace")
+    for line in output.splitlines():
+        if MIKU_DEVICE_NAME in line:
+            match = re.search(r"hw:(\d+),(\d+)", line)
+            if match:
+                return f"/dev/snd/midiC{match.group(1)}D{match.group(2)}"
+    raise RuntimeError(f"raw MIDI device not found for {MIKU_DEVICE_NAME!r} (電源が入っているか確認): {output}")
+
+
+def _parse_pitch(pitch: str) -> int | None:
+    value = str(pitch or "").strip()
+    if value.lower() == "rest":
+        return None
+    match = _PITCH_RE.match(value)
+    if not match:
+        raise ValueError(f"invalid pitch: {pitch!r}")
+    name, accidental, octave = match.groups()
+    semitone = _SEMITONES[name.upper()] + (1 if accidental == "#" else -1 if accidental == "b" else 0)
+    midi = (int(octave) + 1) * 12 + semitone
+    if not 0 <= midi <= 127:
+        raise ValueError(f"pitch out of MIDI range: {pitch!r}")
+    return midi
+
+
+def _prepare_miku(notes: list, bpm: float) -> tuple[str, bytes, list]:
+    """検証と変換をすべて行い、(デバイスパス, 歌詞SysEx, [(note|None, 秒数)]) を返す。音は出さない。"""
+    if not isinstance(notes, list) or not notes:
+        raise ValueError("miku_notes must be a non-empty array")
+    if not isinstance(bpm, (int, float)) or bpm <= 0:
+        raise ValueError("miku_bpm must be positive")
+    phonemes: list[int] = []
+    sequence: list[tuple[int | None, float]] = []
+    for index, item in enumerate(notes):
+        if not isinstance(item, dict):
+            raise ValueError(f"miku_notes[{index}] must be an object")
+        duration_key = str(item.get("duration") or "").strip().lower()
+        if duration_key not in _DURATION_BEATS:
+            raise ValueError(f"miku_notes[{index}].duration invalid: {item.get('duration')!r}")
+        seconds = (60.0 / float(bpm)) * _DURATION_BEATS[duration_key]
+        note = _parse_pitch(str(item.get("pitch") or ""))
+        if note is None:
+            sequence.append((None, seconds))
+            continue
+        lyric = str(item.get("lyric") or "").strip()
+        if lyric not in _MIKU_PHONEMES:
+            raise ValueError(f"miku_notes[{index}].lyric が音素表にありません: {lyric!r}")
+        phonemes.append(_MIKU_PHONEMES[lyric])
+        sequence.append((note, seconds))
+    if len(phonemes) > MIKU_MAX_SYLLABLES:
+        raise ValueError(f"歌詞が長すぎます({len(phonemes)}音節): 最大{MIKU_MAX_SYLLABLES}音節")
+    device = _resolve_miku_rawmidi()
+    sysex = bytes([0xF0, 0x43, 0x79, 0x09, 0x11, 0x0A, 0x00] + phonemes + [0xF7])
+    return device, sysex, sequence
+
+
+def _play_miku_notes(f, sequence: list) -> dict:
+    played = 0
+    for note, seconds in sequence:
+        if note is None:
+            time.sleep(seconds)
+            continue
+        f.write(bytes([0x90, note, 100]))
+        time.sleep(seconds * 0.85)
+        f.write(bytes([0x80, note, 0]))
+        time.sleep(seconds * 0.15)
+        played += 1
+    return {"notes_played": played}
+
+
 def play_song(
     *,
     wav_filename: str = "",
@@ -147,11 +263,17 @@ def play_song(
     abc: str = "",
     library_name: str = "",
     midi_delay_sec: float = 0.0,
+    miku_notes: list | None = None,
+    miku_bpm: float = 100.0,
 ) -> dict:
     modes_given = sum(bool(x) for x in (midi_filename, abc, library_name))
-    if modes_given != 1:
-        raise ValueError("midi_filename, abc, library_name のいずれか一つだけ指定してください")
+    if modes_given > 1:
+        raise ValueError("midi_filename, abc, library_name は同時に一つまでです")
+    if modes_given == 0 and not miku_notes:
+        raise ValueError("midi_filename / abc / library_name / miku_notes のいずれかを指定してください")
 
+    midi_path = ""
+    wav_path = ""
     if library_name:
         if not _NAME_RE.match(library_name):
             raise ValueError(f"invalid library_name: {library_name!r}")
@@ -164,34 +286,69 @@ def play_song(
             candidate = os.path.join(SONG_LIBRARY_DIR, f"{library_name}.wav")
             wav_path = candidate if os.path.isfile(candidate) else ""
     else:
-        midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
-        wav_path = _safe_path(WAV_DIR, wav_filename) if wav_filename else ""
+        if midi_filename or abc:
+            midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
+        if wav_filename:
+            wav_path = _safe_path(WAV_DIR, wav_filename)
 
-    midi_port = _resolve_midi_port()
+    # 音を出す前に検証・変換をすべて済ませる(途中失敗で歌だけ鳴る、を防ぐ)
+    miku_prepared = _prepare_miku(miku_notes, miku_bpm) if miku_notes else None
+    midi_port = _resolve_midi_port() if midi_path else ""
 
-    # VOICEVOX Songの歌声WAVは冒頭に無音パディングがあり、MIDIより聴感上の発音が遅れる。
-    # midi_delay_secでMIDI側の開始を後ろにずらして聴感上の頭出しを揃える。wav省略時はピアノ単独演奏。
-    wav_proc = None
-    if wav_path:
-        wav_proc = subprocess.Popen(
-            ["aplay", "-D", AUDIO_DEVICE, wav_path],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        if midi_delay_sec > 0:
-            time.sleep(midi_delay_sec)
-    midi_proc = subprocess.Popen(
-        ["aplaymidi", "-p", midi_port, midi_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+    # 歌詞SysExのロードは無音なので、他パートの再生開始前に済ませて頭出しを揃える
+    miku_file = None
+    if miku_prepared:
+        device, sysex, sequence = miku_prepared
+        miku_file = open(device, "wb", buffering=0)
+        miku_file.write(sysex)
+        time.sleep(0.15)
 
-    midi_out, _ = midi_proc.communicate()
-    result = {"midi": {"returncode": midi_proc.returncode, "output": midi_out.decode(errors="replace")}}
-    if wav_proc is not None:
-        wav_out, _ = wav_proc.communicate()
-        result["wav"] = {"returncode": wav_proc.returncode, "output": wav_out.decode(errors="replace")}
-    else:
-        result["wav"] = None
-    return result
+    try:
+        # VOICEVOX Songの歌声WAVは冒頭に無音パディングがあり、MIDIより聴感上の発音が遅れる。
+        # midi_delay_secでMIDI/ミク側の開始を後ろにずらして聴感上の頭出しを揃える。
+        wav_proc = None
+        if wav_path:
+            wav_proc = subprocess.Popen(
+                ["aplay", "-D", AUDIO_DEVICE, wav_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if midi_delay_sec > 0:
+                time.sleep(midi_delay_sec)
+
+        miku_result: dict = {}
+        miku_thread = None
+        if miku_file is not None:
+
+            def _miku_run():
+                try:
+                    miku_result.update(_play_miku_notes(miku_file, sequence))
+                except Exception as exc:  # noqa: BLE001
+                    miku_result["error"] = str(exc)
+
+            miku_thread = threading.Thread(target=_miku_run, daemon=True)
+            miku_thread.start()
+
+        midi_proc = None
+        if midi_path:
+            midi_proc = subprocess.Popen(
+                ["aplaymidi", "-p", midi_port, midi_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+
+        result: dict = {"midi": None, "wav": None, "miku": None}
+        if midi_proc is not None:
+            midi_out, _ = midi_proc.communicate()
+            result["midi"] = {"returncode": midi_proc.returncode, "output": midi_out.decode(errors="replace")}
+        if miku_thread is not None:
+            miku_thread.join()
+            result["miku"] = miku_result
+        if wav_proc is not None:
+            wav_out, _ = wav_proc.communicate()
+            result["wav"] = {"returncode": wav_proc.returncode, "output": wav_out.decode(errors="replace")}
+        return result
+    finally:
+        if miku_file is not None:
+            miku_file.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -217,14 +374,22 @@ class Handler(BaseHTTPRequestHandler):
                 abc = str(data.get("abc") or "")
                 library_name = str(data.get("library_name") or "")
                 midi_delay_sec = float(data.get("midi_delay_sec") or 0.0)
+                miku_notes = data.get("miku_notes")
+                miku_bpm = float(data.get("miku_bpm") or 100.0)
                 result = play_song(
                     wav_filename=wav_filename,
                     midi_filename=midi_filename,
                     abc=abc,
                     library_name=library_name,
                     midi_delay_sec=midi_delay_sec,
+                    miku_notes=miku_notes,
+                    miku_bpm=miku_bpm,
                 )
-                ok = result["midi"]["returncode"] == 0 and (result["wav"] is None or result["wav"]["returncode"] == 0)
+                ok = (
+                    (result["midi"] is None or result["midi"]["returncode"] == 0)
+                    and (result["wav"] is None or result["wav"]["returncode"] == 0)
+                    and (result["miku"] is None or "error" not in result["miku"])
+                )
                 self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", **result})
             else:
                 name = str(data.get("name") or "")
