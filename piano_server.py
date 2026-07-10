@@ -12,10 +12,12 @@ POST /play_song
   - wav指定時はaplaymidiとaplayを同時に起動し、両方の終了を待って結果を返す。
 
 POST /save_song
-  {"name": "kirakira_duet", "abc": "X:1\\nT:...\\n...", "wav_filename": "song-xxxx.wav"}
+  {"name": "kirakira_duet", "abc": "X:1\\nT:...\\n...", "wav_filename": "song-xxxx.wav",
+   "miku_notes": [...], "miku_bpm": 120}
   - あかねはWriteツールを持たないため、「残したい曲」を永続化するための保存専用エンドポイント。
-  - name(英数字・_・-のみ)を key に、abcテキストと変換済みMIDI、(あれば)WAVのコピーをSONG_LIBRARY_DIR配下に
-    {name}.abc / {name}.mid / {name}.wav としてセットで保存する。同名は上書き。
+  - name(英数字・_・-のみ)を key に、abcテキストと変換済みMIDI、(あれば)WAVのコピー、(あれば)ミクのパートを
+    SONG_LIBRARY_DIR配下に {name}.abc / {name}.mid / {name}.wav / {name}.miku.json としてセットで保存する。同名は上書き。
+  - library_name指定の/play_songは、{name}.miku.jsonが存在すればミクのパートも自動で一緒に演奏する。
 
 GET /songs
   - SONG_LIBRARY_DIRに保存済みの曲一覧を返す: {"songs": [{"name": "...", "has_wav": true/false}, ...]}
@@ -137,11 +139,13 @@ def _abc_to_midi(abc_text: str) -> str:
     return midi_path
 
 
-def save_song(*, name: str, abc: str, wav_filename: str = "") -> dict:
+def save_song(*, name: str, abc: str, wav_filename: str = "", miku_notes: list | None = None, miku_bpm: float = 100.0) -> dict:
     if not name or not _NAME_RE.match(name):
         raise ValueError(f"invalid name: {name!r}")
     if not abc.strip():
         raise ValueError("abc が空です")
+    if miku_notes:
+        _convert_miku_notes(miku_notes, miku_bpm)  # 保存前に形式検証だけ行う(デバイス不要)
     os.makedirs(SONG_LIBRARY_DIR, exist_ok=True)
     abc_path = os.path.join(SONG_LIBRARY_DIR, f"{name}.abc")
     midi_path = os.path.join(SONG_LIBRARY_DIR, f"{name}.mid")
@@ -154,12 +158,17 @@ def save_song(*, name: str, abc: str, wav_filename: str = "") -> dict:
     if proc.returncode != 0 or not os.path.isfile(midi_path):
         raise ValueError(f"abc2midi failed: {proc.stdout.decode(errors='replace')}")
 
-    result = {"name": name, "abc_path": abc_path, "midi_path": midi_path, "wav_path": None}
+    result = {"name": name, "abc_path": abc_path, "midi_path": midi_path, "wav_path": None, "miku_path": None}
     if wav_filename:
         src_wav = _safe_path(WAV_DIR, wav_filename)
         dst_wav = os.path.join(SONG_LIBRARY_DIR, f"{name}.wav")
         shutil.copyfile(src_wav, dst_wav)
         result["wav_path"] = dst_wav
+    if miku_notes:
+        miku_path = os.path.join(SONG_LIBRARY_DIR, f"{name}.miku.json")
+        with open(miku_path, "w", encoding="utf-8") as f:
+            json.dump({"miku_bpm": miku_bpm, "miku_notes": miku_notes}, f, ensure_ascii=False, indent=1)
+        result["miku_path"] = miku_path
     return result
 
 
@@ -172,7 +181,11 @@ def list_songs() -> list[dict]:
         if fname.endswith(".abc")
     })
     return [
-        {"name": name, "has_wav": os.path.isfile(os.path.join(SONG_LIBRARY_DIR, f"{name}.wav"))}
+        {
+            "name": name,
+            "has_wav": os.path.isfile(os.path.join(SONG_LIBRARY_DIR, f"{name}.wav")),
+            "has_miku": os.path.isfile(os.path.join(SONG_LIBRARY_DIR, f"{name}.miku.json")),
+        }
         for name in names
     ]
 
@@ -211,8 +224,8 @@ def _parse_pitch(pitch: str) -> int | None:
     return midi
 
 
-def _prepare_miku(notes: list, bpm: float) -> tuple[str, bytes, list]:
-    """検証と変換をすべて行い、(デバイスパス, 歌詞SysEx, [(note|None, 秒数)]) を返す。音は出さない。"""
+def _convert_miku_notes(notes: list, bpm: float) -> tuple[list[int], list]:
+    """notesを検証して(音素コード列, [(note|None, 秒数)])に変換する。デバイスには触れない。"""
     if not isinstance(notes, list) or not notes:
         raise ValueError("miku_notes must be a non-empty array")
     if not isinstance(bpm, (int, float)) or bpm <= 0:
@@ -237,6 +250,12 @@ def _prepare_miku(notes: list, bpm: float) -> tuple[str, bytes, list]:
         sequence.append((note, seconds))
     if len(phonemes) > MIKU_MAX_SYLLABLES:
         raise ValueError(f"歌詞が長すぎます({len(phonemes)}音節): 最大{MIKU_MAX_SYLLABLES}音節")
+    return phonemes, sequence
+
+
+def _prepare_miku(notes: list, bpm: float) -> tuple[str, bytes, list]:
+    """検証と変換をすべて行い、(デバイスパス, 歌詞SysEx, [(note|None, 秒数)]) を返す。音は出さない。"""
+    phonemes, sequence = _convert_miku_notes(notes, bpm)
     device = _resolve_miku_rawmidi()
     sysex = bytes([0xF0, 0x43, 0x79, 0x09, 0x11, 0x0A, 0x00] + phonemes + [0xF7])
     return device, sysex, sequence
@@ -285,6 +304,13 @@ def play_song(
         else:
             candidate = os.path.join(SONG_LIBRARY_DIR, f"{library_name}.wav")
             wav_path = candidate if os.path.isfile(candidate) else ""
+        if not miku_notes:
+            miku_candidate = os.path.join(SONG_LIBRARY_DIR, f"{library_name}.miku.json")
+            if os.path.isfile(miku_candidate):
+                with open(miku_candidate, encoding="utf-8") as f:
+                    saved = json.load(f)
+                miku_notes = saved.get("miku_notes")
+                miku_bpm = float(saved.get("miku_bpm") or 100.0)
     else:
         if midi_filename or abc:
             midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
@@ -395,7 +421,12 @@ class Handler(BaseHTTPRequestHandler):
                 name = str(data.get("name") or "")
                 abc = str(data.get("abc") or "")
                 wav_filename = str(data.get("wav_filename") or "")
-                result = save_song(name=name, abc=abc, wav_filename=wav_filename)
+                miku_notes = data.get("miku_notes")
+                miku_bpm = float(data.get("miku_bpm") or 100.0)
+                result = save_song(
+                    name=name, abc=abc, wav_filename=wav_filename,
+                    miku_notes=miku_notes, miku_bpm=miku_bpm,
+                )
                 self._send_json(200, {"status": "ok", **result})
         except (ValueError, FileNotFoundError) as exc:
             self._send_json(400, {"error": str(exc)})
