@@ -32,11 +32,11 @@ DG-STK5S（Ubuntu Server、家庭内LAN上のMIDI/USBオーディオ集約ホス
 {"name": "kirakira_duet", "abc": "X:1\nT:...\n...", "wav_filename": "song-xxxx.wav"}
 ```
 
-あかね(embodied-ha側のエージェント)はWriteツールを持たないため、「残したい曲」を永続化するための保存専用エンドポイント。`name`(英数字・`_`・`-`のみ)をキーに、`SONG_LIBRARY_DIR`(`/mnt/ha-config/embodied-ha/song_library/`)配下へ`{name}.abc`・`{name}.mid`（abcから変換済み）・（`wav_filename`指定時のみ）`{name}.wav`をセットで保存する。同名は上書き。`/home/yunomin61/piano_abc_cache/`（`/play_song`のabc変換に使う使い捨てキャッシュ、7日で自動削除）とは別の永続領域。
+あかね(embodied-ha側のエージェント)はWriteツールを持たないため、「残したい曲」を永続化するための保存専用エンドポイント。`name`(英数字・`_`・`-`のみ)をキーに、`SONG_LIBRARY_DIR`(`/mnt/ha-config/embodied-ha/song_library/`)配下へ`{name}.abc`・`{name}.mid`（abcから変換済み）・（`wav_filename`指定時のみ）`{name}.wav`・（`miku_notes`指定時のみ）`{name}.miku.json`をセットで保存する。同名は上書き。`library_name`指定の`/play_song`は`{name}.miku.json`が存在すればミクのパートも自動で一緒に演奏する。`/home/yunomin61/piano_abc_cache/`（`/play_song`のabc変換に使う使い捨てキャッシュ、7日で自動削除）とは別の永続領域。
 
 ### `GET /songs`
 
-保存済みの曲一覧を返す: `{"songs": [{"name": "kirakira_duet", "has_wav": false}, ...]}`
+保存済みの曲一覧を返す: `{"songs": [{"name": "kirakira_kakeai", "has_wav": true, "has_miku": true}, ...]}`
 
 ### ミク歌唱（`/play_song`の`miku_notes`）
 
