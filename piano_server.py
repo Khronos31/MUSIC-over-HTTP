@@ -9,7 +9,14 @@ POST /play_song
   - midi_filename/abc/library_nameはいずれか一つだけ指定する。wav_filenameは省略可
     （省略時はMIDIのみ再生。library_name指定時は対応する{name}.wavが存在すれば自動で使う）。
   - MIDI/WAVの再生元ファイル名(basenameのみ)はホワイトリスト検証する。
-  - wav指定時はaplaymidiとaplayを同時に起動し、両方の終了を待って結果を返す。
+  - 検証だけ同期で行い、再生はバックグラウンドで開始して即座に {"status": "started"} を返す
+    （長い曲でHTTPクライアントがタイムアウトしないため）。結果は GET /status で確認する。
+  - 同時再生は1つまで。再生中に新しいリクエストが来たら 409 (already_playing) を返す。
+
+GET /status
+  - 現在の再生状態と直近の結果を返す:
+    {"playing": true/false, "started_at": epoch, "finished_at": epoch|null,
+     "summary": {"midi":bool,"wav":bool,"miku":bool,...}, "result": {...}|null}
 
 POST /save_song
   {"name": "kirakira_duet", "abc": "X:1\\nT:...\\n...", "wav_filename": "song-xxxx.wav",
@@ -275,7 +282,7 @@ def _play_miku_notes(f, sequence: list) -> dict:
     return {"notes_played": played}
 
 
-def play_song(
+def prepare_playback(
     *,
     wav_filename: str = "",
     midi_filename: str = "",
@@ -285,6 +292,7 @@ def play_song(
     miku_notes: list | None = None,
     miku_bpm: float = 100.0,
 ) -> dict:
+    """検証・変換をすべて行い、音を一切出さずに再生計画を返す。失敗はここで例外になる。"""
     modes_given = sum(bool(x) for x in (midi_filename, abc, library_name))
     if modes_given > 1:
         raise ValueError("midi_filename, abc, library_name は同時に一つまでです")
@@ -317,14 +325,25 @@ def play_song(
         if wav_filename:
             wav_path = _safe_path(WAV_DIR, wav_filename)
 
-    # 音を出す前に検証・変換をすべて済ませる(途中失敗で歌だけ鳴る、を防ぐ)
     miku_prepared = _prepare_miku(miku_notes, miku_bpm) if miku_notes else None
     midi_port = _resolve_midi_port() if midi_path else ""
 
+    return {
+        "midi_path": midi_path,
+        "midi_port": midi_port,
+        "wav_path": wav_path,
+        "miku": miku_prepared,
+        "midi_delay_sec": midi_delay_sec,
+    }
+
+
+def execute_playback(plan: dict) -> dict:
+    """再生計画を実行して完了まで待つ(ブロッキング)。バックグラウンドスレッドから呼ぶ。"""
     # 歌詞SysExのロードは無音なので、他パートの再生開始前に済ませて頭出しを揃える
     miku_file = None
-    if miku_prepared:
-        device, sysex, sequence = miku_prepared
+    sequence: list = []
+    if plan["miku"]:
+        device, sysex, sequence = plan["miku"]
         miku_file = open(device, "wb", buffering=0)
         miku_file.write(sysex)
         time.sleep(0.15)
@@ -333,13 +352,13 @@ def play_song(
         # VOICEVOX Songの歌声WAVは冒頭に無音パディングがあり、MIDIより聴感上の発音が遅れる。
         # midi_delay_secでMIDI/ミク側の開始を後ろにずらして聴感上の頭出しを揃える。
         wav_proc = None
-        if wav_path:
+        if plan["wav_path"]:
             wav_proc = subprocess.Popen(
-                ["aplay", "-D", AUDIO_DEVICE, wav_path],
+                ["aplay", "-D", AUDIO_DEVICE, plan["wav_path"]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
-            if midi_delay_sec > 0:
-                time.sleep(midi_delay_sec)
+            if plan["midi_delay_sec"] > 0:
+                time.sleep(plan["midi_delay_sec"])
 
         miku_result: dict = {}
         miku_thread = None
@@ -355,9 +374,9 @@ def play_song(
             miku_thread.start()
 
         midi_proc = None
-        if midi_path:
+        if plan["midi_path"]:
             midi_proc = subprocess.Popen(
-                ["aplaymidi", "-p", midi_port, midi_path],
+                ["aplaymidi", "-p", plan["midi_port"], plan["midi_path"]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
 
@@ -375,6 +394,22 @@ def play_song(
     finally:
         if miku_file is not None:
             miku_file.close()
+
+
+# 再生状態(1台のピアノ/ミクを共有するため同時再生は1つに制限する)
+_play_lock = threading.Lock()
+_play_state: dict = {"playing": False, "started_at": None, "finished_at": None, "summary": None, "result": None}
+
+
+def _run_playback_background(plan: dict) -> None:
+    try:
+        result = execute_playback(plan)
+    except Exception as exc:  # noqa: BLE001
+        result = {"error": str(exc)}
+    with _play_lock:
+        _play_state["playing"] = False
+        _play_state["finished_at"] = time.time()
+        _play_state["result"] = result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -402,21 +437,37 @@ class Handler(BaseHTTPRequestHandler):
                 midi_delay_sec = float(data.get("midi_delay_sec") or 0.0)
                 miku_notes = data.get("miku_notes")
                 miku_bpm = float(data.get("miku_bpm") or 100.0)
-                result = play_song(
-                    wav_filename=wav_filename,
-                    midi_filename=midi_filename,
-                    abc=abc,
-                    library_name=library_name,
-                    midi_delay_sec=midi_delay_sec,
-                    miku_notes=miku_notes,
-                    miku_bpm=miku_bpm,
-                )
-                ok = (
-                    (result["midi"] is None or result["midi"]["returncode"] == 0)
-                    and (result["wav"] is None or result["wav"]["returncode"] == 0)
-                    and (result["miku"] is None or "error" not in result["miku"])
-                )
-                self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", **result})
+                with _play_lock:
+                    if _play_state["playing"]:
+                        self._send_json(409, {
+                            "error": "already_playing",
+                            "message": "別の曲を再生中です。終わるのを待つか GET /status で状況を確認してください。",
+                            "current": _play_state["summary"],
+                        })
+                        return
+                    # 検証・変換は同期で行い、失敗はこの場で400を返す。音出しはここから先のスレッドで。
+                    plan = prepare_playback(
+                        wav_filename=wav_filename,
+                        midi_filename=midi_filename,
+                        abc=abc,
+                        library_name=library_name,
+                        midi_delay_sec=midi_delay_sec,
+                        miku_notes=miku_notes,
+                        miku_bpm=miku_bpm,
+                    )
+                    summary = {
+                        "library_name": library_name or None,
+                        "midi": bool(plan["midi_path"]),
+                        "wav": bool(plan["wav_path"]),
+                        "miku": bool(plan["miku"]),
+                    }
+                    _play_state.update(
+                        playing=True, started_at=time.time(), finished_at=None,
+                        summary=summary, result=None,
+                    )
+                threading.Thread(target=_run_playback_background, args=(plan,), daemon=True).start()
+                self._send_json(200, {"status": "started", "parts": summary,
+                                      "hint": "再生はバックグラウンドで進行中。結果は GET /status で確認できます。"})
             else:
                 name = str(data.get("name") or "")
                 abc = str(data.get("abc") or "")
@@ -434,14 +485,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/songs":
-            self._send_json(404, {"error": "not found"})
+        if self.path == "/songs":
+            try:
+                self._send_json(200, {"songs": list_songs()})
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(500, {"error": str(exc)})
             return
-        try:
-            songs = list_songs()
-            self._send_json(200, {"songs": songs})
-        except Exception as exc:  # noqa: BLE001
-            self._send_json(500, {"error": str(exc)})
+        if self.path == "/status":
+            with _play_lock:
+                self._send_json(200, dict(_play_state))
+            return
+        self._send_json(404, {"error": "not found"})
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
         print(f"[piano_server] {self.address_string()} - {fmt % args}")
