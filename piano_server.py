@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -66,19 +67,23 @@ def _resolve_midi_port() -> str:
     raise RuntimeError(f"MIDI port not found for client {MIDI_CLIENT_NAME!r}: {proc.stdout.decode(errors='replace')}")
 
 
-def play_song(*, wav_filename: str, midi_filename: str = "", abc: str = "") -> dict:
+def play_song(*, wav_filename: str, midi_filename: str = "", abc: str = "", midi_delay_sec: float = 0.0) -> dict:
     if bool(midi_filename) == bool(abc):
         raise ValueError("midi_filename と abc はどちらか一方だけ指定してください")
     wav_path = _safe_path(WAV_DIR, wav_filename)
     midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
     midi_port = _resolve_midi_port()
 
-    midi_proc = subprocess.Popen(
-        ["aplaymidi", "-p", midi_port, midi_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+    # VOICEVOX Songの歌声WAVは冒頭に無音パディングがあり、MIDIより聴感上の発音が遅れる。
+    # midi_delay_secでMIDI側の開始を後ろにずらして聴感上の頭出しを揃える。
     wav_proc = subprocess.Popen(
         ["aplay", "-D", AUDIO_DEVICE, wav_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if midi_delay_sec > 0:
+        time.sleep(midi_delay_sec)
+    midi_proc = subprocess.Popen(
+        ["aplaymidi", "-p", midi_port, midi_path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
@@ -111,7 +116,10 @@ class Handler(BaseHTTPRequestHandler):
             wav_filename = str(data.get("wav_filename") or "")
             midi_filename = str(data.get("midi_filename") or "")
             abc = str(data.get("abc") or "")
-            result = play_song(wav_filename=wav_filename, midi_filename=midi_filename, abc=abc)
+            midi_delay_sec = float(data.get("midi_delay_sec") or 0.0)
+            result = play_song(
+                wav_filename=wav_filename, midi_filename=midi_filename, abc=abc, midi_delay_sec=midi_delay_sec
+            )
             ok = result["midi"]["returncode"] == 0 and result["wav"]["returncode"] == 0
             self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", **result})
         except (ValueError, FileNotFoundError) as exc:
