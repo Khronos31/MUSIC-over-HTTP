@@ -4,9 +4,10 @@
 POST /play_song
   {"wav_filename": "...", "midi_filename": "..."}  # 用意済みMIDIファイルを使う
   {"wav_filename": "...", "abc": "X:1\\nT:...\\n..."}  # ABC記法テキストをその場でabc2midi変換して使う
-  - wav_filenameは必須。midi_filename/abcはどちらか一方を指定する。
+  {"midi_filename": "..."} / {"abc": "..."}  # wav_filename省略でピアノ単独演奏
+  - midi_filename/abcはどちらか一方を指定する。wav_filenameは省略可（省略時はMIDIのみ再生）。
   - MIDI/WAVの再生元ファイル名(basenameのみ)はホワイトリスト検証する。
-  - aplaymidi と aplay を同時に起動し、両方の終了を待って結果を返す。
+  - wav_filename指定時はaplaymidiとaplayを同時に起動し、両方の終了を待って結果を返す。
 
 依存: 標準ライブラリのみ。alsa-utils (aplaymidi, aplay) と abcmidi (abc2midi) が別途必要。
 """
@@ -67,33 +68,36 @@ def _resolve_midi_port() -> str:
     raise RuntimeError(f"MIDI port not found for client {MIDI_CLIENT_NAME!r}: {proc.stdout.decode(errors='replace')}")
 
 
-def play_song(*, wav_filename: str, midi_filename: str = "", abc: str = "", midi_delay_sec: float = 0.0) -> dict:
+def play_song(*, wav_filename: str = "", midi_filename: str = "", abc: str = "", midi_delay_sec: float = 0.0) -> dict:
     if bool(midi_filename) == bool(abc):
         raise ValueError("midi_filename と abc はどちらか一方だけ指定してください")
-    wav_path = _safe_path(WAV_DIR, wav_filename)
     midi_path = _safe_path(MIDI_DIR, midi_filename) if midi_filename else _abc_to_midi(abc)
     midi_port = _resolve_midi_port()
 
     # VOICEVOX Songの歌声WAVは冒頭に無音パディングがあり、MIDIより聴感上の発音が遅れる。
-    # midi_delay_secでMIDI側の開始を後ろにずらして聴感上の頭出しを揃える。
-    wav_proc = subprocess.Popen(
-        ["aplay", "-D", AUDIO_DEVICE, wav_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    if midi_delay_sec > 0:
-        time.sleep(midi_delay_sec)
+    # midi_delay_secでMIDI側の開始を後ろにずらして聴感上の頭出しを揃える。wav_filename省略時はピアノ単独演奏。
+    wav_proc = None
+    if wav_filename:
+        wav_path = _safe_path(WAV_DIR, wav_filename)
+        wav_proc = subprocess.Popen(
+            ["aplay", "-D", AUDIO_DEVICE, wav_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        if midi_delay_sec > 0:
+            time.sleep(midi_delay_sec)
     midi_proc = subprocess.Popen(
         ["aplaymidi", "-p", midi_port, midi_path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
     midi_out, _ = midi_proc.communicate()
-    wav_out, _ = wav_proc.communicate()
-
-    return {
-        "midi": {"returncode": midi_proc.returncode, "output": midi_out.decode(errors="replace")},
-        "wav": {"returncode": wav_proc.returncode, "output": wav_out.decode(errors="replace")},
-    }
+    result = {"midi": {"returncode": midi_proc.returncode, "output": midi_out.decode(errors="replace")}}
+    if wav_proc is not None:
+        wav_out, _ = wav_proc.communicate()
+        result["wav"] = {"returncode": wav_proc.returncode, "output": wav_out.decode(errors="replace")}
+    else:
+        result["wav"] = None
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -120,7 +124,7 @@ class Handler(BaseHTTPRequestHandler):
             result = play_song(
                 wav_filename=wav_filename, midi_filename=midi_filename, abc=abc, midi_delay_sec=midi_delay_sec
             )
-            ok = result["midi"]["returncode"] == 0 and result["wav"]["returncode"] == 0
+            ok = result["midi"]["returncode"] == 0 and (result["wav"] is None or result["wav"]["returncode"] == 0)
             self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", **result})
         except (ValueError, FileNotFoundError) as exc:
             self._send_json(400, {"error": str(exc)})
