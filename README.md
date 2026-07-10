@@ -38,6 +38,15 @@ DG-STK5S（Ubuntu Server、家庭内LAN上のMIDI/USBオーディオ集約ホス
 
 保存済みの曲一覧を返す: `{"songs": [{"name": "kirakira_duet", "has_wav": false}, ...]}`
 
+### ミク歌唱（`/play_song`の`miku_notes`）
+
+```
+{"miku_bpm": 120, "miku_notes": [{"pitch": "C4", "duration": "quarter", "lyric": "き"}, ...],
+ "abc": "..."}
+```
+
+DG-STK5Sに接続された**NSX-39（ポケット・ミク）**にリアルタイムで歌わせる。歌詞SysExをスロットに流し込み、Note On/Offで1音節ずつ発声させる方式。`miku_notes`の形式はembodied-ha側の`record`ツールと同一（pitch=音名/`rest`、duration=`whole`〜`sixteenth`、lyric=ひらがな1音節、最大64音節）。ひらがな→音素コード変換はサーバー内蔵の対応表（Yamaha公式`nsx39.js`由来）で行う。`abc`/`wav_filename`と併用でき、歌詞ロード（無音）を再生開始前に済ませることで他パートと頭出しが揃う。ミク+LK-222ピアノ伴奏の同時演奏を実機確認済み（2026-07-10）。NSX-39のデバイスは`amidi -l`から名前で動的解決（カード番号は接続順で変わるため）。
+
 呼び出し元の使い方（家全体のコンテキストにおけるこのAPIの位置づけ）は `Khronos31/embodied-ha` リポジトリの `/config/embodied-ha/device_apis.md`（あかね向けドキュメント）を参照。
 
 ## 依存
